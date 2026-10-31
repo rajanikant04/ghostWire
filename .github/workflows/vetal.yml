@@ -1,0 +1,173 @@
+name: "🌳 Vetal"
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  issue_comment:
+    types: [created]
+
+permissions:
+  pull-requests: write
+  statuses: write
+  contents: read
+
+jobs:
+  riddle:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (default branch only)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve &
+          sleep 5
+
+      - name: Pull Gemma
+        run: |
+          ollama pull gemma3:1b
+
+      - name: Install Vetal
+        run: pip install .
+
+      - name: Get diff and ask riddle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Get the PR diff as plain text (never checkout PR code)
+          DIFF=$(gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY")
+
+          # Generate riddle, save to file
+          echo "$DIFF" | python -m vetal riddle --json > /tmp/vetal_riddle.json
+
+          # Build the comment
+          TALE=$(python -c "import json; d=json.load(open('/tmp/vetal_riddle.json')); print(d['tale'])")
+          RIDDLE=$(python -c "import json; d=json.load(open('/tmp/vetal_riddle.json')); print(d['riddle'])")
+
+          # Post comment
+          BODY=$(cat <<EOF
+          🌳 *Something heavy drops onto your shoulders from the tamarind tree...*
+
+          > ${TALE}
+
+          **Tell me, Vikram:** ${RIDDLE}
+
+          *If you know the answer and keep silent, your head will burst into a thousand pieces.*
+
+          ---
+          Reply with \`/answer your explanation here\` to respond to Vetal.
+          EOF
+          )
+
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+
+          # Set pending status
+          gh api repos/$GITHUB_REPOSITORY/statuses/${{ github.event.pull_request.head.sha }} \
+            -f state=pending \
+            -f context="vetal" \
+            -f description="Vetal awaits your answer, Vikram."
+
+      - name: Save riddle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vetal-riddle
+          path: /tmp/vetal_riddle.json
+
+  answer:
+    if: >
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/answer')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check author
+        env:
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          PR_AUTHOR: ${{ github.event.issue.user.login }}
+        run: |
+          if [ "$COMMENT_AUTHOR" != "$PR_AUTHOR" ]; then
+            echo "Only the PR author may answer Vetal."
+            exit 0
+          fi
+
+      - name: Checkout (default branch only)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve &
+          sleep 5
+
+      - name: Pull Gemma
+        run: ollama pull gemma3:1b
+
+      - name: Install Vetal
+        run: pip install .
+
+      - name: Judge answer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          # Extract answer (strip /answer prefix)
+          ANSWER=$(echo "$COMMENT_BODY" | sed 's|^/answer\s*||')
+
+          # Get diff
+          DIFF=$(gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY")
+
+          # Write answer to file (never pass through shell expansion)
+          echo "$ANSWER" > /tmp/vetal_answer.txt
+          echo "$DIFF" > /tmp/vetal_diff.txt
+
+          # Judge
+          python -m vetal judge-pr \
+            --diff-file /tmp/vetal_diff.txt \
+            --answer-file /tmp/vetal_answer.txt \
+            --json > /tmp/vetal_judgment.json
+
+          VERDICT=$(python -c "import json; d=json.load(open('/tmp/vetal_judgment.json')); print(d['verdict'])")
+          RESPONSE=$(python -c "import json; d=json.load(open('/tmp/vetal_judgment.json')); print(d['response'])")
+
+          # Get PR head SHA for status
+          PR_SHA=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
+
+          if [ "$VERDICT" = "release" ]; then
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --body "🌳 *${RESPONSE}*
+
+            Vetal lets go and flies back to his tree. ✅"
+
+            gh api repos/$GITHUB_REPOSITORY/statuses/$PR_SHA \
+              -f state=success \
+              -f context="vetal" \
+              -f description="Vetal releases you. Push well, Vikram."
+          else
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --body "🌳 *${RESPONSE}*
+
+            Vetal clings tighter. Try again with \`/answer your explanation\`. ❌"
+
+            gh api repos/$GITHUB_REPOSITORY/statuses/$PR_SHA \
+              -f state=failure \
+              -f context="vetal" \
+              -f description="Vetal clings. Answer again, Vikram."
+          fi
